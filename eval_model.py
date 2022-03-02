@@ -10,24 +10,38 @@ from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.ops import knn_points
 import mcubes
 import utils_vox
+import torch.nn as nn
+import pickle, os
+import numpy as np
+import matplotlib.pyplot as plt
+
+from train_model import calculate_loss
+sigmoid = nn.Sigmoid()
+
+
+from visualization import visualize_voxel, visualize_voxel_360, visualize_mesh_360, visualize_point, reder_mesh
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Singleto3D', add_help=False)
     parser.add_argument('--arch', default='resnet18', type=str)
     parser.add_argument('--max_iter', default=10000, type=str)
-    parser.add_argument('--vis_freq', default=1000, type=str)
+    parser.add_argument('--vis_freq', default=100, type=int)
     parser.add_argument('--batch_size', default=1, type=str)
     parser.add_argument('--num_workers', default=0, type=str)
     parser.add_argument('--type', default='vox', choices=['vox', 'point', 'mesh'], type=str)
-    parser.add_argument('--n_points', default=5000, type=int)
+    parser.add_argument('--n_points', default=4096, type=int)
     parser.add_argument('--w_chamfer', default=1.0, type=float)
-    parser.add_argument('--w_smooth', default=0.1, type=float)  
-    parser.add_argument('--load_checkpoint', action='store_true')  
+    parser.add_argument('--w_smooth', default=0.1, type=float) 
+    parser.add_argument('--surfix', default='', type = str) 
+    parser.add_argument('--save_image', action='store_true')  
+    parser.add_argument('--save', default='vis')
+    parser.add_argument('--device', default='cuda:0', type=str)
+
     return parser
 
-def preprocess(feed_dict):
+def preprocess(feed_dict, device = 'cuda:0'):
     for k in ['images']:
-        feed_dict[k] = feed_dict[k].cuda()
+        feed_dict[k] = feed_dict[k].to(device)
 
     images = feed_dict['images'].squeeze(1)
     mesh = feed_dict['mesh']
@@ -78,6 +92,7 @@ def evaluate(predictions, mesh_gt, args):
         mesh_src = pytorch3d.structures.Meshes([vertices_src], [faces_src])
         pred_points = sample_points_from_meshes(mesh_src, args.n_points)
         pred_points = utils_vox.Mem2Ref(pred_points, H, W, D)
+
     elif args.type == "point":
         pred_points = predictions.cpu()
     elif args.type == "mesh":
@@ -92,6 +107,7 @@ def evaluate(predictions, mesh_gt, args):
 
 def evaluate_model(args):
     r2n2_dataset = R2N2("test", dataset_location.SHAPENET_PATH, dataset_location.R2N2_PATH, dataset_location.SPLITS_PATH, return_voxels=True)
+    # r2n2_dataset = R2N2("train", dataset_location.SHAPENET_PATH, dataset_location.R2N2_PATH, dataset_location.SPLITS_PATH, return_voxels=True)
 
     loader = torch.utils.data.DataLoader(
         r2n2_dataset,
@@ -103,7 +119,7 @@ def evaluate_model(args):
     eval_loader = iter(loader)
 
     model =  SingleViewto3D(args)
-    model.cuda()
+    model.to(args.device)
     model.eval()
 
     start_iter = 0
@@ -111,10 +127,9 @@ def evaluate_model(args):
 
     avg_f1_score = []
 
-    if args.load_checkpoint:
-        checkpoint = torch.load(f'checkpoint_{args.type}.pth')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Succesfully loaded iter {start_iter}")
+    checkpoint = torch.load(f'checkpoint_{args.surfix}{args.type}.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Succesfully loaded iter {start_iter}")
     
     print("Starting evaluating !")
     max_iter = len(eval_loader)
@@ -125,30 +140,70 @@ def evaluate_model(args):
 
         feed_dict = next(eval_loader)
 
-        images_gt, mesh_gt = preprocess(feed_dict)
+        images_gt, mesh_gt = preprocess(feed_dict, args.device)
 
         read_time = time.time() - read_start_time
 
         predictions = model(images_gt, args)
 
+        if args.type == "vox":
+            loss = calculate_loss(predictions, feed_dict['voxels'].float().to(args.device), args)
+            print("loss", loss)
+            predictions = sigmoid(predictions)
+            predictions = predictions.permute(0,1,4,3,2)
+
         metrics = evaluate(predictions, mesh_gt, args)
 
         # TODO:
-        # if (step % args.vis_freq) == 0:
-        #     # visualization block
-        #     #  rend = 
-        #     plt.imsave(f'vis/{step}_{args.type}.png', rend)
-      
+        if (step % args.vis_freq) == 0:
+            # visualization block
+            if args.type == "vox":
+                vox = predictions[0][0].detach().cpu().numpy()
+                visualize_voxel_360(vox, save = '%s/%i_%s.gif'%(args.save, step, args.type))
+                visualize_voxel_360(feed_dict['voxels'][0][0].detach().cpu().numpy(), save = '%s/gt%i_%s.gif'%(args.save, step, args.type))
+            if args.type == "point":
+                verts = predictions.detach()
+                rgb = (verts - verts.min()) / (verts.max() - verts.min())
+                point_cloud = pytorch3d.structures.Pointclouds(points=verts, features=rgb)
+                visualize_point(point_cloud, save = '%s/%i_%s.gif'%(args.save, step, args.type))
+
+                mesh_tgt = pytorch3d.structures.Meshes(verts=feed_dict['verts'], faces=feed_dict['faces'])
+                pointclouds_tgt = sample_points_from_meshes(mesh_tgt, args.n_points)
+                print("pointclouds_tgt.max()", pointclouds_tgt.max())
+                print("pointclouds_tgt.min()", pointclouds_tgt.min())
+                rgb = (pointclouds_tgt - pointclouds_tgt.min()) / (pointclouds_tgt.max() - pointclouds_tgt.min())
+                point_cloud = pytorch3d.structures.Pointclouds(points=pointclouds_tgt, features=rgb)
+                visualize_point(point_cloud, save = '%s/gt%i_%s.gif'%(args.save, step, args.type))
+            
+            if args.type == "mesh":
+                mesh = predictions
+                textures = torch.ones_like(mesh.verts_list()[0]).unsqueeze(0)# (1, N_v, 3)
+
+                mesh.textures = pytorch3d.renderer.TexturesVertex(textures)
+                mesh = mesh.to(args.device)
+                reder_mesh(mesh, save = '%s/%i_%s.gif'%(args.save, step, args.type))
+
+                textures = torch.ones_like(feed_dict['verts'][0]).unsqueeze(0)# (1, N_v, 3)
+                mesh_tgt = pytorch3d.structures.Meshes(verts=feed_dict['verts'], faces=feed_dict['faces'], textures=pytorch3d.renderer.TexturesVertex(textures)).to(args.device)
+                reder_mesh(mesh_tgt, save = '%s/gt%i_%s.gif'%(args.save, step, args.type))
+            
+            if args.save_image:
+                plt.imshow(images_gt[0].detach().cpu().numpy())
+                plt.savefig('%s/image%i_%s.png'%(args.save, step, args.type), bbox_inches='tight',transparent=True, pad_inches=0)
 
         total_time = time.time() - start_time
         iter_time = time.time() - iter_start_time
 
         f1_05 = metrics['F1@0.050000']
 
-        avg_f1_score.append(f1_05)
+        avg_f1_score.append(f1_05.detach().cpu().numpy())
 
         print("[%4d/%4d]; ttime: %.0f (%.2f, %.2f); F1@0.05: %.3f; Avg F1@0.05: %.3f" % (step, max_iter, total_time, read_time, iter_time, f1_05, torch.tensor(avg_f1_score).mean()))
 
+    avg_f1_score = np.array(avg_f1_score)
+    print("average_f1_score: ", avg_f1_score.mean())
+    with open(os.path.join(args.save, args.surfix + args.type + "avg_f1_score.pkl"), 'wb') as file:
+        pickle.dump(avg_f1_score, file)
     print('Done!')
 
 if __name__ == '__main__':
